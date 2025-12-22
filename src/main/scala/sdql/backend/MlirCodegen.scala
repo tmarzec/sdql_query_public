@@ -39,7 +39,7 @@ object MlirCodegen {
   case class Emitted(code: Vector[String], value: String)
 
   def run(e: Exp): Emitted = {
-    def bindToName(x: Exp, desired: Option[String])(implicit ctx : TypesCtx): Emitted = x match {
+    def bindToName(x: Exp, desired: Option[String], expected: Option[Type] = None)(implicit ctx : TypesCtx): Emitted = x match {
       // let x = e1 in e2
       case LetBinding(x @ Sym(name), e1, e2) => {
         val boundName = s"%$name"
@@ -82,11 +82,11 @@ object MlirCodegen {
       // ex: %dict = sdql.empty_dictionary : dictionary<i32, f16>
       case DictNode(Nil, _) => {
         // TODO: handle empty dict (currently type inference breaks)
-        raise(f"unhandled empty dictionary in MlirCodegen.bindToName()")
+        // raise(f"unhandled empty dictionary in MlirCodegen.bindToName()")
 
-        // val typ = mlirType(TypeInference.run(x)(ctx))
-        // val binding = desired.getOrElse(fresh.next("%dict"))
-        // Emitted(Vector(s"$binding = sdql.empty_dictionary : $typ"), binding)
+        val typ = mlirType(expected.get)
+        val binding = desired.getOrElse(fresh.next("%dict"))
+        Emitted(Vector(s"$binding = sdql.empty_dictionary : $typ"), binding)
       }
 
       // ex: %8 = sdql.create_dictionary %5, %7 : i32, i1 -> dictionary<i32, i1>
@@ -233,8 +233,8 @@ object MlirCodegen {
         val t = bindToName(thenp, None)
         val tTyp = mlirType(TypeInference.run(thenp))
 
-        val e = bindToName(elsep, None)
-        val eTyp = mlirType(TypeInference.run(elsep))
+        // val eTyp = mlirType(TypeInference.run(elsep))
+        val e = bindToName(elsep, None, Some(TypeInference.run(x)))
 
         val binding = desired.getOrElse(fresh.next("%if"))
         val code = c.code ++
@@ -243,7 +243,7 @@ object MlirCodegen {
             Vector(s"  \"scf.yield\"(${t.value}) : ($tTyp) -> ()") ++
             Vector("}, {") ++
             e.code.map("  " + _) ++
-            Vector(s"  \"scf.yield\"(${e.value}) : ($eTyp) -> ()") ++
+            Vector(s"  \"scf.yield\"(${e.value}) : (${tTyp}) -> ()") ++
             Vector(s"}) : ($cTyp) -> $outT")
         Emitted(code, binding)
       }
@@ -363,6 +363,46 @@ object MlirCodegen {
     //     val op = s"$binding = \"arith.cmpi\"(${comp.value}, $zero) <{predicate = 0}> : (i1, i1) -> i1"
     //     Emitted(comp.code ++ Vector(zeroOp, op), comp.value)
     //   }
+      case Neg(e) if List(IntType, LongType).contains(TypeInference.run(e)) => {          
+          val binding = desired.getOrElse(fresh.next("%addf"))
+
+          val comp = bindToName(e, None)
+          val t = mlirType(TypeInference.run(e))
+
+          val zero = desired.getOrElse(fresh.next("%zero"))
+          val zeroOp = s"$zero = \"arith.constant\"() <{value = 0 : $t}> : () -> $t"
+
+          val op = s"$binding = \"arith.subi\"($zero, ${comp.value}) : ($t, $t) -> $t"
+          Emitted(comp.code ++ Vector(zeroOp) ++ Vector(op), binding)
+      }
+      case Neg(e) if TypeInference.run(e) == RealType => {          
+          val binding = desired.getOrElse(fresh.next("%addf"))
+
+          val comp = bindToName(e, None)
+          val t = mlirType(TypeInference.run(e))
+
+          val zero = desired.getOrElse(fresh.next("%zero"))
+          val zeroOp = s"$zero = \"arith.constant\"() <{value = 0 : $t}> : () -> $t"
+
+          val op = s"$binding = \"arith.subf\"($zero, ${comp.value}) <{fastmath = #arith.fastmath<none>}> : ($t, $t) -> $t"
+          Emitted(comp.code ++ Vector(zeroOp) ++ Vector(op), binding)
+      }
+
+      case Concat(e1, e2)
+      if TypeInference.run(e1).isInstanceOf[RecordType] && TypeInference.run(e2).isInstanceOf[RecordType] => {
+        val outT = TypeInference.run(x)
+
+        val typ1 = mlirType(TypeInference.run(e1))
+        val typ2 = mlirType(TypeInference.run(e2))
+
+        val gen1 = bindToName(e1, None)
+        val gen2 = bindToName(e2, None)
+
+        val binding = desired.getOrElse(fresh.next("%concat"))
+
+        val op = s"$binding = sdql.concat ${gen1.value}, ${gen2.value} : $typ1, $typ2 -> $outT"
+        Emitted(gen1.code ++ gen2.code ++ Vector(op), binding)
+      }
 
       case _ => {
         raise("¯\\_(ツ)_/¯ " + x)
