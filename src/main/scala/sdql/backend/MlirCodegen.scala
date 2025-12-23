@@ -20,8 +20,8 @@ object MlirCodegen {
             val attrsTyped = attrs.map(attr => s"\"${attr.name}\" : ${mlirType(attr.tpe)})")
             attrsTyped.mkString("record<", ", ", ">")
         }
-        case StringType(Some(maxLen)) => s"vector<${maxLen}xi8>"
-        case StringType(None) => raise("StringType(None) no supported in MlirCodegen.mlirType()") 
+        case StringType(Some(maxLen)) => s"memref<${maxLen}xi8>"
+        case StringType(None) => s"memref<?xi8>" 
         case _ => raise(f"unhandled type $typ in MlirCodegen.mlirType()")
     }
 
@@ -79,6 +79,12 @@ object MlirCodegen {
         Emitted(Vector(res), binding)
       }
 
+      case Const(v: String) => {
+        val binding = desired.getOrElse(fresh.next("%consts"))
+        val res = s"$binding = \"arith.constant\"() <{value = dense<[${v.getBytes().mkString("[", ", ", "]")}]}> : () -> memref<${v.size}xi1>"
+        Emitted(Vector(res), binding)
+      }
+
       // ex: %dict = sdql.empty_dictionary : dictionary<i32, f16>
       case DictNode(Nil, _) => {
         // TODO: handle empty dict (currently type inference breaks)
@@ -110,8 +116,10 @@ object MlirCodegen {
         val binding = desired.getOrElse(fresh.next("%get"))
 
         TypeInference.run(e1) match {
-            case _: RecordType => {
-              raise(f"unhandled lookup on RecordType in MlirCodegen.bindToName()")
+            case recType: RecordType => {
+              // %val = sdql.access_record %rec "a" : record<"a": i32, "b": f32> -> i32 
+              val res = s"$binding = sdql.access_record ${where.value} \"${what.value}\" : ${recType.attrs.map(attr => s"${attr.name}: ${mlirType(attr.tpe)}").mkString("record<", ", ", ">")}"
+              Emitted(where.code ++ what.code ++ Vector(res), binding)
             }
             case dictType: DictType => {
               // ex: %val = sdql.lookup_dictionary %dict [%key : i32] : dictionary<i32, f16> -> f16
@@ -248,6 +256,28 @@ object MlirCodegen {
         Emitted(code, binding)
       }
       
+      case Cmp(e1, e2, cmp) if (e2.isInstanceOf[DictNode] && e2.asInstanceOf[DictNode].map == Nil) => {
+        // is it always i1?
+        val outT = mlirType(TypeInference.run(x))
+
+        val predicateVal = cmp match {
+          // https://mlir.llvm.org/docs/Dialects/ArithOps/#cmpfpredicate
+          case "<=" => 5
+          case "<" => 4
+          case "!=" => 6
+        }
+        val comp1 = bindToName(e1, None)
+        val type1 = TypeInference.run(e1)
+        val t1 = mlirType(type1)
+        val comp2 = bindToName(e2, None, Some(type1))
+        val t2 = t1
+
+        val binding = desired.getOrElse(fresh.next("%cmpf"))
+
+        val op = s"$binding = \"arith.cmpf\"(${comp1.value}, ${comp2.value}) <{fastmath = #arith.fastmath<none>, predicate = $predicateVal}> : ($t1, $t2) -> $outT"
+        Emitted(comp1.code ++ comp2.code ++ Vector(op), binding)
+      }
+
       // %2 = "arith.cmpi"(%0, %1) <{predicate = 3}> : (i32, i32) -> i1
       case Cmp(e1, e2, cmp)
         if (TypeInference.run(e1) == IntType || TypeInference.run(e1) == LongType || TypeInference.run(e1) == DateType) &&
@@ -259,6 +289,8 @@ object MlirCodegen {
             // https://mlir.llvm.org/docs/Dialects/ArithOps/#cmpipredicate
             case "<=" => 3
             case "<" => 2
+            case "==" => 0
+            case "!=" => 1
           }
           val comp1 = bindToName(e1, None)
           val t1 = mlirType(TypeInference.run(e1))
@@ -270,8 +302,8 @@ object MlirCodegen {
           val op = s"$binding = \"arith.cmpi\"(${comp1.value}, ${comp2.value}) <{predicate = $predicateVal}> : ($t1, $t2) -> $outT"
           Emitted(comp1.code ++ comp2.code ++ Vector(op), binding)
         }
-    
-      case Cmp(e1, e2, cmp) if (TypeInference.run(e1) == RealType || TypeInference.run(e2) == RealType) => {
+
+      case Cmp(e1, e2, cmp) if (TypeInference.run(e1) == RealType || TypeInference.run(e1) == RealType) => {
         // is it always i1?
         val outT = mlirType(TypeInference.run(x))
 
@@ -279,6 +311,8 @@ object MlirCodegen {
           // https://mlir.llvm.org/docs/Dialects/ArithOps/#cmpfpredicate
           case "<=" => 5
           case "<" => 4
+          case "!=" => 6
+          case "==" => 1
         }
         val comp1 = bindToName(e1, None)
         val t1 = mlirType(TypeInference.run(e1))
@@ -351,18 +385,18 @@ object MlirCodegen {
           Emitted(comp1.code ++ comp2.code ++ Vector(op), binding)
       }
 
-    //   case Neg(e) if TypeInference.run(e) == BoolType => {
-    //     val zero = desired.getOrElse(fresh.next("%zero"))
-    //     val zeroOp = s"$zero = \"arith.constant\"() <{value = 0 : i1}> : () -> i1"
+      case Neg(e) if TypeInference.run(e) == BoolType => {
+        val zero = desired.getOrElse(fresh.next("%zero"))
+        val zeroOp = s"$zero = \"arith.constant\"() <{value = 0 : i1}> : () -> i1"
 
-    //     // val res = s"$binding = \"arith.constant\"() <{value = $v : i32}> : () -> i32"
+        // val res = s"$binding = \"arith.constant\"() <{value = $v : i32}> : () -> i32"
 
-    //     val binding = desired.getOrElse(fresh.next("%neg"))
+        val binding = desired.getOrElse(fresh.next("%neg"))
 
-    //     val comp = bindToName(e, None)
-    //     val op = s"$binding = \"arith.cmpi\"(${comp.value}, $zero) <{predicate = 0}> : (i1, i1) -> i1"
-    //     Emitted(comp.code ++ Vector(zeroOp, op), comp.value)
-    //   }
+        val comp = bindToName(e, None)
+        val op = s"$binding = \"arith.cmpi\"(${comp.value}, $zero) <{predicate = 0}> : (i1, i1) -> i1"
+        Emitted(comp.code ++ Vector(zeroOp, op), comp.value)
+      }
       case Neg(e) if List(IntType, LongType).contains(TypeInference.run(e)) => {          
           val binding = desired.getOrElse(fresh.next("%addf"))
 
@@ -402,6 +436,48 @@ object MlirCodegen {
 
         val op = s"$binding = sdql.concat ${gen1.value}, ${gen2.value} : $typ1, $typ2 -> $outT"
         Emitted(gen1.code ++ gen2.code ++ Vector(op), binding)
+      }
+
+      case External(name, args) => {
+        val outT = TypeInference.run(x)
+        
+        val generated = args.map(bindToName(_, None))
+        val types = args.map(TypeInference.run)
+        println(s"name=$name, types=$types")
+        val binding = desired.getOrElse(fresh.next("%external"))
+
+        val op = s"$binding = sdql.external $name, ${generated.map(_.value).mkString(", ")} : ${types.map(mlirType)}} : ${mlirType(outT)}"
+        Emitted(generated.flatMap(_.code).toVector ++ Vector(op), binding)
+      }
+
+      case Cmp(e1, e2, cmp) if cmp == "==" => {
+        val outT = TypeInference.run(x)
+
+        val typ1 = mlirType(TypeInference.run(e1))
+        val typ2 = e2 match {
+            // workaround for `a != { }`
+            case DictNode(Nil, _) => typ1
+            case _ => mlirType(TypeInference.run(e2))
+        }
+
+        val gen1 = bindToName(e1, None)
+        // workaround for a != { }
+        val gen2 = bindToName(e2, None, expected = Some(TypeInference.run(e1)))
+
+        val binding = desired.getOrElse(fresh.next("%cmp"))
+
+        val op = s"$binding = sdql.cmp ${gen1.value}, ${gen2.value} : $typ1, $typ2 -> $outT"
+        Emitted(gen1.code ++ gen2.code ++ Vector(op), binding)
+      }
+
+      case Cmp(e1, e2, cmp) if cmp == "!=" => {
+        val negated = Cmp(e1, e2, "==")
+        bindToName(Neg(negated), desired, expected)
+      }
+
+      case Unique(_) => {
+        println("unique... " + TypeInference.run(x).prettyPrint)
+        Emitted(Vector.empty, "")
       }
 
       case _ => {
