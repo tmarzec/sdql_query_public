@@ -59,7 +59,7 @@ object MlirCodegen {
 
     bindToName(e, None, expectedType = None)(ctx, builder)
 
-    builder.result
+    genRangeBuiltin ++ builder.result
   }
 
   def bindToName(x: Exp, desired: Option[String], expectedType: Option[Type] = None)(implicit
@@ -87,7 +87,9 @@ object MlirCodegen {
 
       case Const(v: Double) =>
         val name = desired.getOrElse(builder.fresh("%constd"))
-        builder.line(s"$name = \"arith.constant\"() <{value = $v : f64}> : () -> f64")
+        builder.line(
+          s"$name = \"arith.constant\"() <{value = ${if (v.toString == "0") "0.0" else v}  : f64}> : () -> f64"
+        )
         V(name, RealType)
 
       case Const(v: Boolean)   =>
@@ -109,7 +111,7 @@ object MlirCodegen {
         builder.line(s"// $v")
         // TODO: handle encoding stuff
         builder.line(
-          s"$name = \"arith.constant\"() <{value = dense<${v.getBytes().mkString("[", ", ", "]")}}> : () -> memref<${v.size}xi1>"
+          s"$name = \"arith.constant\"() <{value = dense<${v.getBytes().mkString("[", ", ", "]")}> : ${mlirType(tpe)}}> : () -> ${mlirType(tpe)}"
         )
         V(name, tpe)
 
@@ -294,14 +296,16 @@ object MlirCodegen {
         // emit then branch
         builder.withIndent {
           val thenBranch = bindToName(thenp, desired = None, expectedType = Some(outTyp))
-          builder.line(s"\"scf.yield\"(${thenBranch.name}) : (${mlirType(outTyp)} -> ()")
+          val upcasted = upcastTo(thenBranch, outTyp)
+          builder.line(s"\"scf.yield\"(${upcasted.name}) : (${mlirType(outTyp)}) -> ()")
         }
         builder.line("}, {")
 
         // emit else branch
         builder.withIndent {
           val elseBranch = bindToName(elsep, desired = None, expectedType = Some(outTyp))
-          builder.line(s"\"scf.yield\"(${elseBranch.name}) : (${mlirType(outTyp)} -> ()")
+          val upcasted = upcastTo(elseBranch, outTyp)
+          builder.line(s"\"scf.yield\"(${upcasted.name}) : (${mlirType(outTyp)}) -> ()")
         }
 
         builder.line(s"}) : (i1) -> ${mlirType(outTyp)}")
@@ -388,33 +392,37 @@ object MlirCodegen {
         )
         V(name, outTyp)
 
-      case Add(e1, e2) if List(IntType, LongType).contains(TypeInference.run(e1)) =>
+      case Add(e1, e2) if List(IntType, LongType).contains(TypeInference.run(x)) =>
         val outTyp = TypeInference.run(x)
         val outT   = mlirType(outTyp)
 
         val name = desired.getOrElse(builder.fresh("%addi"))
 
         val comp1 = bindToName(e1, None)
-        val t1    = mlirType(TypeInference.run(e1))
         val comp2 = bindToName(e2, None)
-        val t2    = mlirType(TypeInference.run(e2))
 
-        builder.line(s"$name = \"arith.addi\"(${comp1.name}, ${comp2.name}) : ($t1, $t2) -> $outT")
+        // operands need to be of the same type
+        val lhs = upcastTo(comp1, outTyp)
+        val rhs = upcastTo(comp2, outTyp)
+
+        builder.line(s"$name = \"arith.addi\"(${lhs.name}, ${rhs.name}) : ($outT, $outT) -> $outT")
         V(name, outTyp)
 
-      case Add(e1, e2) if TypeInference.run(e1) == RealType =>
+      case Add(e1, e2) if TypeInference.run(x) == RealType =>
         val outTyp = TypeInference.run(x)
         val outT   = mlirType(outTyp)
 
         val name = desired.getOrElse(builder.fresh("%addf"))
 
         val comp1 = bindToName(e1, None)
-        val t1    = mlirType(TypeInference.run(e1))
         val comp2 = bindToName(e2, None)
-        val t2    = mlirType(TypeInference.run(e2))
+
+        // operands need to be of the same type
+        val lhs = upcastTo(comp1, outTyp)
+        val rhs = upcastTo(comp2, outTyp)
 
         builder.line(
-          s"$name = \"arith.addf\"(${comp1.name}, ${comp2.name}) <{fastmath = #arith.fastmath<none>}> : ($t1, $t2) -> $outT"
+          s"$name = \"arith.addf\"(${lhs.name}, ${rhs.name}) <{fastmath = #arith.fastmath<none>}> : ($outT, $outT) -> $outT"
         )
         V(name, outTyp)
 
@@ -451,7 +459,7 @@ object MlirCodegen {
         val t    = mlirType(TypeInference.run(e))
 
         val zero = desired.getOrElse(builder.fresh("%zero"))
-        builder.line(s"$zero = \"arith.constant\"() <{value = 0 : $t}> : () -> $t")
+        builder.line(s"$zero = \"arith.constant\"() <{value = 0.0 : $t}> : () -> $t")
 
         builder.line(
           s"$name = \"arith.subf\"($zero, ${comp.name}) <{fastmath = #arith.fastmath<none>}> : ($t, $t) -> $t"
@@ -482,7 +490,7 @@ object MlirCodegen {
         val name = desired.getOrElse(builder.fresh("%external"))
 
         builder.line(
-          s"$name = sdql.external $extName, ${generated.map(_.name).mkString(", ")} : ${types.map(mlirType)}} : ${mlirType(outT)}"
+          s"$name = sdql.external \"$extName\", ${generated.map(_.name).mkString(", ")} : ${types.map(mlirType).mkString(", ")} -> ${mlirType(outT)}"
         )
         V(name, outT)
 
@@ -509,11 +517,66 @@ object MlirCodegen {
         val negated = Cmp(e1, e2, "==")
         bindToName(Neg(negated), desired, expectedType)
 
-      case Unique(_) =>
-        println("unique... " + TypeInference.run(x).prettyPrint)
-        V("1", TypeInference.run(x))
+      // TODO: what does it exactly do?
+      case Unique(e)                       =>
+        val outTyp = TypeInference.run(x)
+
+        val name = desired.getOrElse(builder.fresh("%uniq"))
+
+        val gen   = bindToName(e, None, None)
+        val inTyp = gen.typ
+
+        builder.line(s"$name = sdql.unique ${gen.name} : ${mlirType(inTyp)} -> ${mlirType(outTyp)}")
+        V(name, TypeInference.run(x))
 
       case _ =>
         raise("¯\\_(ツ)_/¯ " + x)
     }
+
+  private def upcastTo(v: V, target: Type)(implicit builder: MlirBuilder): V =
+    (v.typ, target) match {
+      case (IntType, LongType) =>
+        val name = builder.fresh("%extsi")
+        builder.line(s"$name = \"arith.extsi\"(${v.name}) : (i32) -> i64")
+        V(name, LongType)
+
+      case (IntType, RealType) =>
+        val name = builder.fresh("%sitofp")
+        builder.line(s"$name = \"arith.sitofp\"(${v.name}) : (i32) -> f64")
+        V(name, RealType)
+
+      case (LongType, RealType) =>
+        val name = builder.fresh("%sitofp")
+        builder.line(s"$name = \"arith.sitofp\"(${v.name}) : (i64) -> f64")
+        V(name, RealType)
+
+      // TODO handle DateType (acts like i32)
+
+      case (from, to)           =>
+        if (from == to) v else raise(s"no supported upcast from ${from.prettyPrint} to ${to.prettyPrint}")
+    }
+
+  def genRangeBuiltin: Vector[String] =
+    Vector(
+      "func.func @range_builtin(%n: i32) -> dictionary<i32, i32> {",
+      "  %zero = \"arith.constant\"() <{value = 0}> : () -> i32",
+      "  %is_terminal = \"arith.cmpi\"(%n, %zero) <{\"predicate\" = 3}> : (i32, i32) -> i1",
+      "  %res = \"scf.if\"(%is_terminal) ({",
+      "    %empty = sdql.empty_dictionary : dictionary<i32, i32>",
+      "    \"scf.yield\"(%empty) : (dictionary<i32, i32>) -> ()",
+      "  }, {",
+      "    %one = \"arith.constant\"() <{value = 1}> : () -> i32",
+      "    %smaller_n = \"arith.subi\"(%n, %one) : (i32, i32) -> i32",
+      "    %prev_range = \"func.call\"(%smaller_n) <{callee = @range}> : (i32) -> dictionary<i32, i32>",
+      "    %true = \"arith.constant\"() <{value = 1}> : () -> i32",
+      "    %extension = sdql.create_dictionary %smaller_n, %true : i32, i32 -> dictionary<i32, i32>",
+      "",
+      "    // return %extension + %prev_range",
+      "    %added = sdql.dictionary_add %extension %prev_range : dictionary<i32, i32>, dictionary<i32, i32> -> dictionary<i32, i32>",
+      "    \"scf.yield\"(%added) : (dictionary<i32, i32>) -> ()",
+      "  }) : (i1) -> dictionary<i32, i32>",
+      "  func.return %res : dictionary<i32, i32>",
+      "}"
+    )
+
 }
