@@ -35,7 +35,7 @@ object Main {
           val prog     = SourceCode.fromFile(filePath.toString).exp
           println("prog: " + prog)
           val procodegened = MlirCodegen.run(prog)
-          println(procodegened.code.mkString("\n"))
+          println(procodegened.mkString("\n"))
 
           println(prog)
           val llql     = Rewriter.rewrite(prog)
@@ -63,7 +63,7 @@ object Main {
           )
         )
         val prog = MlirCodegen.run(q)
-        println(prog.code.mkString("\n"))
+        println(prog.mkString("\n"))
 
         val q2: Exp =
           LetBinding(Sym("outer"),
@@ -93,7 +93,7 @@ object Main {
           )
           val prog2 = MlirCodegen.run(q2)
           println("\nprog2: ")
-          println(prog2.code.mkString("\n"))
+          println(prog2.mkString("\n"))
         // }
       case "benchmark" =>
         if (args.length < 4) { raise("usage: `run benchmark n <path> <sdql_files>*`") }
