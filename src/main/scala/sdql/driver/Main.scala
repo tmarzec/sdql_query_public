@@ -33,11 +33,6 @@ object Main {
         for (fileName <- fileNames) {
           val filePath = dirPath.resolve(fileName)
           val prog     = SourceCode.fromFile(filePath.toString).exp
-          println("prog: " + prog)
-          val procodegened = MlirCodegen.run(prog)
-          println(procodegened.mkString("\n"))
-
-          println(prog)
           val llql     = Rewriter.rewrite(prog)
           val res      = CppCodegen(llql)
           println(fileName)
