@@ -1,6 +1,12 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
-OUT_DIR="/Users/tmarzec/projects/scair/tests/filecheck/dialects/sdql/tpch-gen"
+if [ "$#" -ne 1 ]; then
+  echo "Usage: $0 <out_dir>"
+  echo "Example: $0 ../scair/tests/filecheck/dialects/sdql/tpch-gen"
+  exit 2
+fi
+
+OUT_DIR="$1"
 mkdir -p "$OUT_DIR"
 
 failed=""
