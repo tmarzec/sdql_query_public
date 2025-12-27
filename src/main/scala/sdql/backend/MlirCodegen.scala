@@ -530,7 +530,7 @@ object MlirCodegen {
         V(name, TypeInference.run(x))
 
       case _ =>
-        raise("¯\\_(ツ)_/¯ " + x)
+        raise("Unsupported expression in MLIR codegen: " + x)
     }
 
   private def upcastTo(v: V, target: Type)(implicit builder: MlirBuilder): V =
